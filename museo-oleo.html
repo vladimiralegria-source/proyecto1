@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Estudio Holandés al Óleo — Three.js</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #090807; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; left: 12px; bottom: 10px; color: #d0c4a9; font: 12px/1.2 Georgia, serif;
+      letter-spacing: 0.3px; opacity: 0.8; pointer-events: none;
+      text-shadow: 0 1px 2px #000;
+    }
+  </style>
+</head>
+<body>
+<div id="hud">Estudio holandés en óleo procedural · OrbitControls (damping 0.02)</div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/RenderPass.js';
+import { ShaderPass } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.VSMShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x15110d, 7.5, 17.0);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 50);
+camera.position.set(2.6, 2.0, 5.4);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.02;
+controls.minDistance = 3.8;
+controls.maxDistance = 8.3;
+controls.minPolarAngle = 0.84;
+controls.maxPolarAngle = 1.42;
+controls.minAzimuthAngle = -0.95;
+controls.maxAzimuthAngle = 0.6;
+controls.target.set(-0.2, 1.1, 0);
+
+const PALETTE = [
+  new THREE.Color('#f2ead1'), // blanco titanio
+  new THREE.Color('#dfc883'), // amarillo Nápoles
+  new THREE.Color('#bf9d52'), // ocre amarillo
+  new THREE.Color('#8f6d3d'), // siena natural
+  new THREE.Color('#6f4a2d'), // siena tostada
+  new THREE.Color('#4f3a28'), // sombra tostada
+  new THREE.Color('#3d3226'), // sombra natural
+  new THREE.Color('#181410'), // negro marfil
+  new THREE.Color('#9a3d25'), // bermellón
+  new THREE.Color('#69717a')  // gris azulado apagado
+];
+
+const keyLight = new THREE.DirectionalLight(0xffd8a1, 2.2);
+keyLight.position.set(-4.7, 4.8, 1.2);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(2048, 2048);
+keyLight.shadow.camera.left = -6;
+keyLight.shadow.camera.right = 6;
+keyLight.shadow.camera.top = 6;
+keyLight.shadow.camera.bottom = -6;
+keyLight.shadow.blurSamples = 10;
+keyLight.shadow.radius = 2.5;
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x7f8ea2, 0.12); // ~5%
+fillLight.position.set(4, 2.5, 1.5);
+scene.add(fillLight);
+
+const oilUniformsBase = {
+  uTime: { value: 0 },
+  uKeyDir: { value: keyLight.position.clone().normalize() },
+  uFillDir: { value: fillLight.position.clone().normalize() },
+  uKeyColor: { value: keyLight.color.clone() },
+  uFillColor: { value: fillLight.color.clone() },
+  uImpasto: { value: 0.12 },
+  uRoughness: { value: 0.75 },
+  uMetal: { value: 0.05 },
+  uBrushMode: { value: 0 }, // 0 plano, 1 fino, 2 circular
+  uBaseColor: { value: new THREE.Color('#8f6d3d') },
+  uAccent: { value: new THREE.Color('#dfc883') }
+};
+
+function oilMaterial(params = {}) {
+  const u = THREE.UniformsUtils.clone(oilUniformsBase);
+  Object.entries(params).forEach(([k, v]) => { if (u[k]) u[k].value = v; });
+  const mat = new THREE.ShaderMaterial({
+    uniforms: u,
+    vertexShader: /* glsl */`
+      varying vec3 vPosW;
+      varying vec3 vNormalW;
+      varying vec2 vUv;
+      varying vec3 vViewDir;
+      void main() {
+        vUv = uv;
+        vec4 w = modelMatrix * vec4(position, 1.0);
+        vPosW = w.xyz;
+        vNormalW = normalize(mat3(modelMatrix) * normal);
+        vViewDir = normalize(cameraPosition - vPosW);
+        gl_Position = projectionMatrix * viewMatrix * w;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec3 vPosW;
+      varying vec3 vNormalW;
+      varying vec2 vUv;
+      varying vec3 vViewDir;
+      uniform float uTime;
+      uniform vec3 uKeyDir;
+      uniform vec3 uFillDir;
+      uniform vec3 uKeyColor;
+      uniform vec3 uFillColor;
+      uniform float uImpasto;
+      uniform float uRoughness;
+      uniform float uMetal;
+      uniform float uBrushMode;
+      uniform vec3 uBaseColor;
+      uniform vec3 uAccent;
+
+      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+      float noise(vec2 p){
+        vec2 i = floor(p), f = fract(p);
+        float a = hash(i), b = hash(i + vec2(1,0)), c = hash(i + vec2(0,1)), d = hash(i + vec2(1,1));
+        vec2 u = f*f*(3.0-2.0*f);
+        return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+      }
+      float fbm(vec2 p){
+        float f=0.0, a=0.5;
+        for(int i=0;i<5;i++){ f += a*noise(p); p = mat2(1.6,-1.2,1.2,1.6)*p*1.7; a*=0.5; }
+        return f;
+      }
+
+      vec3 paletteSnap(vec3 c){
+        vec3 pal[10];
+        pal[0]=vec3(0.949,0.918,0.820);
+        pal[1]=vec3(0.875,0.784,0.514);
+        pal[2]=vec3(0.749,0.616,0.322);
+        pal[3]=vec3(0.561,0.427,0.239);
+        pal[4]=vec3(0.435,0.290,0.176);
+        pal[5]=vec3(0.310,0.227,0.157);
+        pal[6]=vec3(0.239,0.196,0.149);
+        pal[7]=vec3(0.094,0.078,0.063);
+        pal[8]=vec3(0.604,0.239,0.145);
+        pal[9]=vec3(0.412,0.443,0.478);
+        float best = 9e9; vec3 outC = pal[0];
+        for(int i=0;i<10;i++){
+          vec3 d = c - pal[i];
+          float e = dot(d,d);
+          if(e<best){best=e; outC=pal[i];}
+        }
+        return outC;
+      }
+
+      float brushHeight(vec2 uv, vec3 n){
+        vec2 dir = normalize(abs(n.y)>0.75 ? vec2(1.0, 0.1) : vec2(0.2, 1.0));
+        if(uBrushMode>1.5){
+          vec2 c = uv - 0.5;
+          float ang = atan(c.y,c.x);
+          dir = vec2(cos(ang), sin(ang));
+        } else if(uBrushMode>0.5){
+          dir = normalize(vec2(0.7, 0.7));
+        }
+        float a = fbm(uv*4.0 + dir*1.5);
+        float b = fbm(uv*14.0 + dir*6.0);
+        float c = fbm(uv*36.0 - dir*4.0);
+        return a*0.65 + b*0.28 + c*0.07;
+      }
+
+      void main(){
+        vec3 n = normalize(vNormalW);
+        vec3 v = normalize(vViewDir);
+
+        vec3 t = normalize(cross(vec3(0.0,1.0,0.0), n));
+        if(length(t) < 0.01) t = normalize(cross(vec3(1.0,0.0,0.0), n));
+        vec3 b = normalize(cross(n,t));
+
+        vec2 uv = fract(vUv*2.0 + vPosW.xz*0.1);
+        float h = brushHeight(uv, n);
+
+        vec2 parallax = (v.xy) * ((h-0.5) * uImpasto * 0.28);
+        vec2 puv = uv + parallax;
+
+        float hx = brushHeight(puv + vec2(0.005,0.0), n) - brushHeight(puv - vec2(0.005,0.0), n);
+        float hy = brushHeight(puv + vec2(0.0,0.005), n) - brushHeight(puv - vec2(0.0,0.005), n);
+        vec3 nBrush = normalize(n + t*hx*uImpasto*2.7 + b*hy*uImpasto*2.7);
+
+        float warm = fbm(vPosW.xz*0.75 + vPosW.y*0.2);
+        vec3 albedo = mix(uBaseColor, uAccent, smoothstep(0.25,0.82,warm));
+        albedo *= mix(0.84,1.09, h);
+        albedo = paletteSnap(albedo);
+
+        float ndl = max(dot(nBrush, normalize(-uKeyDir)), 0.0);
+        float ndf = max(dot(nBrush, normalize(-uFillDir)), 0.0);
+        vec3 diff = albedo * (uKeyColor*ndl*1.25 + uFillColor*ndf*0.25);
+
+        vec3 hK = normalize(normalize(-uKeyDir) + v);
+        float specPow = mix(12.0, 65.0, 1.0 - uRoughness);
+        float spec = pow(max(dot(nBrush, hK), 0.0), specPow) * (0.08 + h*uImpasto*0.8);
+
+        float cavity = smoothstep(0.15, 0.85, h);
+        float shadowGroove = mix(0.72, 1.08, cavity);
+        vec3 color = diff*shadowGroove + spec*mix(albedo, vec3(1.0), 0.35+uMetal*0.5);
+
+        color *= vec3(1.04, 0.97, 0.90); // calidez óleo
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `
+  });
+  return mat;
+}
+
+function add(mesh){ mesh.castShadow = true; mesh.receiveShadow = true; scene.add(mesh); return mesh; }
+
+// Habitación
+const room = new THREE.Group(); scene.add(room);
+const wallMat = oilMaterial({ uBaseColor: new THREE.Color('#6f6346'), uAccent: new THREE.Color('#bf9d52'), uImpasto: 0.16, uBrushMode: 0 });
+const floorMat = oilMaterial({ uBaseColor: new THREE.Color('#3f3023'), uAccent: new THREE.Color('#6f4a2d'), uImpasto: 0.12, uBrushMode: 0 });
+
+const floor = add(new THREE.Mesh(new THREE.PlaneGeometry(8, 8), floorMat));
+floor.rotation.x = -Math.PI/2;
+
+const backWall = add(new THREE.Mesh(new THREE.PlaneGeometry(8, 4), wallMat));
+backWall.position.set(0, 2, -4);
+const rightWall = add(new THREE.Mesh(new THREE.PlaneGeometry(8, 4), wallMat));
+rightWall.position.set(4, 2, 0); rightWall.rotation.y = -Math.PI/2;
+const leftWall = add(new THREE.Mesh(new THREE.PlaneGeometry(8, 4), wallMat));
+leftWall.position.set(-4, 2, 0); leftWall.rotation.y = Math.PI/2;
+
+// Ventana alta
+const windowFrameMat = oilMaterial({ uBaseColor: new THREE.Color('#4b3c2d'), uAccent: new THREE.Color('#8f6d3d'), uImpasto: 0.11, uBrushMode: 1 });
+const glassMat = oilMaterial({ uBaseColor: new THREE.Color('#69717a'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.06, uRoughness: 0.15, uBrushMode: 2 });
+const windowGroup = new THREE.Group();
+windowGroup.position.set(-3.99, 2.15, -0.6);
+windowGroup.rotation.y = Math.PI/2;
+const frame = add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 2.2, 1.4), windowFrameMat));
+frame.position.copy(windowGroup.position);
+const pane = add(new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.8, 16, 24), glassMat));
+pane.position.set(-3.93, 2.15, -0.6); pane.rotation.y = Math.PI/2;
+const pos = pane.geometry.attributes.position;
+for(let i=0;i<pos.count;i++){
+  const y = pos.getY(i), z = pos.getZ(i);
+  pos.setX(i, Math.sin(y*7.0+z*5.3)*0.012 + Math.sin(y*12.0)*0.004);
+}
+pos.needsUpdate = true;
+pane.geometry.computeVertexNormals();
+for(let i=0;i<4;i++){
+  const mullion = add(new THREE.Mesh(new THREE.BoxGeometry(0.03, 1.8, 0.03), windowFrameMat));
+  mullion.position.set(-3.925, 2.15, -1.02 + i*0.28);
+}
+const cross = add(new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 1.05), windowFrameMat));
+cross.position.set(-3.925, 2.15, -0.6);
+
+// Mesa
+const woodMat = oilMaterial({ uBaseColor: new THREE.Color('#4f3a28'), uAccent: new THREE.Color('#8f6d3d'), uImpasto: 0.14, uBrushMode: 0 });
+const table = add(new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.12, 1.35), woodMat));
+table.position.set(-0.9, 1.02, -0.2);
+for (const [x,z] of [[-1.95,-0.78],[-1.95,0.38],[0.15,-0.78],[0.15,0.38]]) {
+  const leg = add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.0, 0.1), woodMat));
+  leg.position.set(x, 0.5, z);
+}
+
+// Armario y libros
+const cabinet = add(new THREE.Mesh(new THREE.BoxGeometry(1.25, 2.8, 0.52), woodMat));
+cabinet.position.set(2.6, 1.4, -3.62);
+for(let i=0;i<7;i++){
+  const b = add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.35+Math.random()*0.15, 0.23), oilMaterial({
+    uBaseColor: new THREE.Color(i%2? '#6f4a2d':'#3d3226'), uAccent: new THREE.Color('#8f6d3d'), uImpasto: 0.09, uBrushMode: 1
+  })));
+  b.position.set(2.25+i*0.08, 1.35, -3.38 + (Math.random()-0.5)*0.02);
+  b.rotation.y = (Math.random()-0.5)*0.15;
+}
+
+// Bodegón objetos
+const brassMat = oilMaterial({ uBaseColor: new THREE.Color('#bf9d52'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.2, uRoughness: 0.25, uMetal: 0.7, uBrushMode: 2 });
+const pewterMat = oilMaterial({ uBaseColor: new THREE.Color('#69717a'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.1, uRoughness: 0.35, uMetal: 0.45, uBrushMode: 2 });
+const waxMat = oilMaterial({ uBaseColor: new THREE.Color('#dfc883'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.22, uBrushMode: 2 });
+
+const candlestick = add(new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.16,0.22,24), brassMat));
+candlestick.position.set(-1.4, 1.14, -0.05);
+const stem = add(new THREE.Mesh(new THREE.CylinderGeometry(0.04,0.055,0.35,24), brassMat));
+stem.position.set(-1.4, 1.33, -0.05);
+const cup = add(new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.08,0.08,24), brassMat));
+cup.position.set(-1.4, 1.54, -0.05);
+const candle = add(new THREE.Mesh(new THREE.CylinderGeometry(0.042,0.05,0.25,18), waxMat));
+candle.position.set(-1.4, 1.67, -0.05);
+for(let i=0;i<9;i++){
+  const drip = add(new THREE.Mesh(new THREE.SphereGeometry(0.013+Math.random()*0.01,8,8), waxMat));
+  drip.position.set(-1.4 + (Math.random()-0.5)*0.06, 1.55 + Math.random()*0.1, -0.05 + (Math.random()-0.5)*0.06);
+}
+
+const plate = add(new THREE.Mesh(new THREE.CylinderGeometry(0.35,0.35,0.035,40), pewterMat));
+plate.position.set(-0.6, 1.09, 0.15);
+const lemon = add(new THREE.Mesh(new THREE.SphereGeometry(0.11,24,20), oilMaterial({ uBaseColor: new THREE.Color('#bf9d52'), uAccent: new THREE.Color('#dfc883'), uImpasto: 0.2, uBrushMode: 2 })));
+lemon.position.set(-0.62, 1.16, 0.14); lemon.scale.set(1.2,0.88,0.92);
+const peel = add(new THREE.Mesh(new THREE.TorusKnotGeometry(0.08,0.015,100,12,2,5), oilMaterial({ uBaseColor: new THREE.Color('#bf9d52'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.2, uBrushMode: 2 })));
+peel.position.set(-0.5, 1.14, 0.12); peel.scale.set(0.8,0.35,0.7); peel.rotation.x = 1.3;
+
+const letter = add(new THREE.Mesh(new THREE.PlaneGeometry(0.45,0.28), oilMaterial({ uBaseColor: new THREE.Color('#f2ead1'), uAccent: new THREE.Color('#dfc883'), uImpasto: 0.07, uBrushMode: 1 })));
+letter.position.set(-0.18, 1.105, -0.05); letter.rotation.x = -Math.PI/2.2; letter.rotation.z = 0.22;
+const seal = add(new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.015,16), oilMaterial({ uBaseColor: new THREE.Color('#9a3d25'), uAccent: new THREE.Color('#f2ead1'), uImpasto: 0.17, uBrushMode: 2 })));
+seal.position.set(-0.07,1.12,-0.01);
+
+const wineBowl = add(new THREE.Mesh(new THREE.SphereGeometry(0.11,24,22), oilMaterial({ uBaseColor: new THREE.Color('#3d3226'), uAccent: new THREE.Color('#9a3d25'), uImpasto: 0.08, uRoughness: 0.2, uBrushMode: 2 })));
+wineBowl.position.set(0.12, 1.2, 0.24); wineBowl.scale.y = 0.8;
+const wineStem = add(new THREE.Mesh(new THREE.CylinderGeometry(0.015,0.02,0.16,16), glassMat));
+wineStem.position.set(0.12, 1.09, 0.24);
+
+// Paño de terciopelo
+const clothGeo = new THREE.PlaneGeometry(1.55, 1.5, 26, 30);
+const cpos = clothGeo.attributes.position;
+for(let i=0;i<cpos.count;i++){
+  const x = cpos.getX(i), y = cpos.getY(i);
+  cpos.setZ(i, Math.sin(x*12.0)*0.08 + Math.sin(y*8.0)*0.07);
+}
+clothGeo.computeVertexNormals();
+const cloth = add(new THREE.Mesh(clothGeo, oilMaterial({ uBaseColor: new THREE.Color('#231d1a'), uAccent: new THREE.Color('#4f3a28'), uImpasto: 0.18, uRoughness: 0.88, uBrushMode: 0 })));
+cloth.position.set(-1.1, 0.65, 0.5); cloth.rotation.x = -0.2;
+
+// Haz de luz y motas de polvo (pintadas)
+const beam = add(new THREE.Mesh(new THREE.ConeGeometry(0.95, 5.1, 28, 1, true), new THREE.MeshBasicMaterial({
+  color: 0xffdeaa, transparent: true, opacity: 0.06, depthWrite: false
+})));
+beam.position.set(-2.9, 2.8, -0.5); beam.rotation.z = -1.03; beam.rotation.x = 0.1;
+
+const dustCount = 140;
+const dustPos = new Float32Array(dustCount*3);
+for(let i=0;i<dustCount;i++){
+  dustPos[i*3+0] = -2.6 + Math.random()*2.7;
+  dustPos[i*3+1] = 0.8 + Math.random()*2.1;
+  dustPos[i*3+2] = -1.2 + Math.random()*1.8;
+}
+const dustGeo = new THREE.BufferGeometry(); dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+const dust = new THREE.Points(dustGeo, new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false,
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `uniform float uTime; void main(){ vec3 p = position; p.y += sin(uTime*0.3 + position.x*9.0)*0.02; vec4 mv = modelViewMatrix * vec4(p,1.0); gl_PointSize = 5.0 / -mv.z; gl_Position = projectionMatrix * mv; }`,
+  fragmentShader: `void main(){ vec2 uv = gl_PointCoord-0.5; float a = smoothstep(0.48,0.0,length(uv)); gl_FragColor = vec4(0.875,0.784,0.514,a*0.48); }`
+}));
+scene.add(dust);
+
+// Posproceso
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.14, 0.4, 0.94));
+
+const depthRT = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { depthBuffer: true, stencilBuffer: false });
+depthRT.depthTexture = new THREE.DepthTexture(innerWidth, innerHeight, THREE.UnsignedShortType);
+const depthMat = new THREE.MeshDepthMaterial();
+depthMat.depthPacking = THREE.RGBADepthPacking;
+
+const edgePass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    tDepth: { value: depthRT.depthTexture },
+    uResolution: { value: new THREE.Vector2(innerWidth, innerHeight) }
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy,0.0,1.0);} `,
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform vec2 uResolution;
+    float lum(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
+    float rand(vec2 p){ return fract(sin(dot(p, vec2(41.4,289.1)))*9381.12); }
+    void main(){
+      vec2 px = 1.0 / uResolution;
+      vec3 c = texture2D(tDiffuse, vUv).rgb;
+      float d = texture2D(tDepth, vUv).r;
+      float e = 0.0;
+      for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){
+        vec2 o = vec2(float(x),float(y))*px;
+        e += abs(texture2D(tDepth, vUv+o).r - d)*1.8;
+        e += abs(lum(texture2D(tDiffuse, vUv+o).rgb)-lum(c))*0.2;
+      }
+      float edge = smoothstep(0.015, 0.08, e);
+      vec3 blur = vec3(0.0);
+      blur += texture2D(tDiffuse, vUv + px*vec2(1,0)).rgb;
+      blur += texture2D(tDiffuse, vUv - px*vec2(1,0)).rgb;
+      blur += texture2D(tDiffuse, vUv + px*vec2(0,1)).rgb;
+      blur += texture2D(tDiffuse, vUv - px*vec2(0,1)).rgb;
+      blur *= 0.25;
+      float brush = rand(vUv*uResolution*0.5);
+      vec3 mixed = mix(c, blur + brush*0.018, edge*0.62);
+      gl_FragColor = vec4(mixed,1.0);
+    }
+  `
+});
+composer.addPass(edgePass);
+
+const canvasPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0.0 },
+    uCam: { value: new THREE.Vector3() },
+    uResolution: { value: new THREE.Vector2(innerWidth, innerHeight) }
+  },
+  vertexShader: `varying vec2 vUv; void main(){vUv=uv; gl_Position = vec4(position.xy,0.0,1.0);} `,
+  fragmentShader: `
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform float uTime; uniform vec3 uCam; uniform vec2 uResolution;
+    float n(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+    void main(){
+      vec3 c = texture2D(tDiffuse, vUv).rgb;
+      vec2 uv = vUv*uResolution.xy/vec2(1.0,1.0);
+      float weaveA = sin(uv.x*0.55)*0.5+0.5;
+      float weaveB = sin(uv.y*0.58+1.3)*0.5+0.5;
+      float weave = weaveA*weaveB;
+      float sheen = pow(max(0.0, dot(normalize(vec3(0.3,0.2,1.0)), normalize(vec3(fract(uCam.x*0.3),fract(uCam.y*0.2),1.0)))), 18.0);
+      c *= mix(0.96, 1.04, weave);
+      c += sheen*0.03*weave;
+      c += (n(uv+uTime)-0.5)*0.01;
+      gl_FragColor = vec4(c,1.0);
+    }
+  `
+});
+composer.addPass(canvasPass);
+
+const varnishPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0.0 },
+    uResolution: { value: new THREE.Vector2(innerWidth, innerHeight) }
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0);} `,
+  fragmentShader: `
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform float uTime; uniform vec2 uResolution;
+    float hash(vec2 p){ return fract(sin(dot(p,vec2(12.4,87.1)))*9123.11); }
+    float crack(vec2 p){
+      p*=7.0;
+      vec2 i=floor(p), f=fract(p);
+      float m=1.0;
+      for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){
+        vec2 g=vec2(float(x),float(y));
+        vec2 o=vec2(hash(i+g), hash(i+g+1.7));
+        vec2 r=g+o-f;
+        m=min(m,length(r));
+      }
+      return smoothstep(0.07,0.09,m);
+    }
+    void main(){
+      vec3 c = texture2D(tDiffuse,vUv).rgb;
+      vec2 q = vUv-0.5;
+      float vign = smoothstep(0.66,0.17,length(q));
+      float amber = 0.75 + (1.0-vign)*0.25;
+      c *= vec3(1.08, 0.94, 0.78) * amber;
+      float craq = crack(vUv*uResolution/900.0 + uTime*0.005);
+      c = mix(c*0.97, c, craq);
+      float gloss = pow(max(0.0, 1.0-length(q)*1.4), 16.0) * 0.04;
+      c += gloss;
+      c *= vign;
+      gl_FragColor = vec4(c,1.0);
+    }
+  `
+});
+composer.addPass(varnishPass);
+
+function resize(){
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  depthRT.setSize(innerWidth, innerHeight);
+  edgePass.uniforms.uResolution.value.set(innerWidth, innerHeight);
+  canvasPass.uniforms.uResolution.value.set(innerWidth, innerHeight);
+  varnishPass.uniforms.uResolution.value.set(innerWidth, innerHeight);
+}
+addEventListener('resize', resize);
+
+const mats = [];
+scene.traverse(o=>{ if(o.material?.uniforms?.uTime) mats.push(o.material); });
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  controls.update();
+
+  mats.forEach(m => m.uniforms.uTime.value = t);
+  dust.material.uniforms.uTime.value = t;
+  canvasPass.uniforms.uTime.value = t;
+  canvasPass.uniforms.uCam.value.copy(camera.position);
+  varnishPass.uniforms.uTime.value = t;
+
+  const oldBG = scene.background;
+  scene.overrideMaterial = depthMat;
+  renderer.setRenderTarget(depthRT);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  scene.overrideMaterial = null;
+  scene.background = oldBG;
+
+  composer.render();
+});
+</script>
+</body>
+</html>
